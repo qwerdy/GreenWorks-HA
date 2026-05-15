@@ -21,7 +21,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import CONF_MOWER_NAME, DOMAIN
 from . import GreenWorksDataCoordinator
-from GreenWorksAPI.GreenWorksAPI import Mower
+from .greenworks_api.GreenWorksAPI import Mower
 
 _LOGGER = logging.getLogger(__name__)
 

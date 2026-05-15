@@ -10,7 +10,7 @@ from homeassistant import config_entries, core
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-from GreenWorksAPI.GreenWorksAPI import GreenWorksAPI, Mower, UnauthorizedException
+from .greenworks_api.GreenWorksAPI import GreenWorksAPI, Mower, UnauthorizedException
 from .const import CONF_MOWER_NAME, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)

@@ -7,6 +7,6 @@
   "documentation": "https://github.com/Boes24/GreenWorks-HA",
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/Boes24/GreenWorks-HA/issues",
-  "requirements": ["GreenWorks==0.1.0.0"],
+  "requirements": [],
   "version": "0.1.0"
 }
