@@ -6,7 +6,11 @@ from typing import Any
 from homeassistant import config_entries
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.data_entry_flow import FlowResult
-from .greenworks_api.GreenWorksAPI import UnauthorizedException, GreenWorksAPI
+from .greenworks_api.GreenWorksAPI import (
+    GreenWorksAPI,
+    GreenWorksApiError,
+    UnauthorizedException,
+)
 from .const import CONF_MOWER_NAME, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
@@ -53,6 +57,11 @@ class GreenworksConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors["base"] = "auth_error"
             return self.async_show_form(
                 step_id="user", data_schema=AUTH_SCHEMA, errors=errors)
+        except GreenWorksApiError as ex:
+            _LOGGER.debug("Could not reach the GreenWorks API: %s", ex)
+            errors["base"] = "cannot_connect"
+            return self.async_show_form(
+                step_id="user", data_schema=AUTH_SCHEMA, errors=errors)
 
         if self._email is None or self._password is None:
             errors["base"] = "auth_error"
@@ -62,10 +71,14 @@ class GreenworksConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             mowers = await self.hass.async_add_executor_job(api.get_devices)
         except UnauthorizedException as ex:
             errors["base"] = "auth_error"
-            _LOGGER.error("Unauthorized error fetching devices", ex, exc_info=True, stack_info=True)
+            _LOGGER.debug("Unauthorized error fetching devices: %s", ex)
             return self.async_show_form(step_id="user", data_schema=AUTH_SCHEMA, errors=errors)
-        except Exception as ex:
-            _LOGGER.error("Error fetching devices: %s", ex)
+        except GreenWorksApiError as ex:
+            _LOGGER.debug("Error fetching devices: %s", ex)
+            errors["base"] = "cannot_connect"
+            return self.async_show_form(step_id="user", data_schema=AUTH_SCHEMA, errors=errors)
+        except Exception:  # noqa: BLE001 - show the error in the UI, don't crash the flow
+            _LOGGER.debug("Unexpected error fetching devices", exc_info=True)
             errors["base"] = "unknown_error"
             return self.async_show_form(step_id="user", data_schema=AUTH_SCHEMA, errors=errors)
 

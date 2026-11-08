@@ -41,8 +41,9 @@ def test_get_devices_live():
 def test_refresh_access_token_success():
     """Ensure refresh_access_token updates tokens on success and doesn't re-login."""
     # Mock login (first POST) and refresh (second POST), and user info (__request)
-    with mock.patch('greenworks_api.GreenWorksAPI.requests.post') as mock_post, \
+    with mock.patch('greenworks_api.GreenWorksAPI.requests.Session') as mock_session, \
          mock.patch('greenworks_api.GreenWorksAPI.GreenWorksAPI._GreenWorksAPI__request') as mock_req:
+        mock_post = mock_session.return_value.post
 
         # First POST: login
         login_resp = mock.Mock()
@@ -98,8 +99,9 @@ def test_refresh_access_token_success():
 
 def test_refresh_access_token_refresh_fail_relogin_success():
     """When refresh returns non-200, the client performs a re-login and updates tokens."""
-    with mock.patch('greenworks_api.GreenWorksAPI.requests.post') as mock_post, \
+    with mock.patch('greenworks_api.GreenWorksAPI.requests.Session') as mock_session, \
          mock.patch('greenworks_api.GreenWorksAPI.GreenWorksAPI._GreenWorksAPI__request') as mock_req:
+        mock_post = mock_session.return_value.post
 
         # POST sequence: initial login OK, refresh fails, re-login OK
         login_resp1 = mock.Mock()

@@ -2,15 +2,87 @@
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
 from datetime import datetime
+import socket
 import time
 import requests
 import json
 import logging
+
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 from .Records import Login_object, Mower_operating_status, User_info_object, Mower_properties
 from .Enums import MowerState
 
 
 logger = logging.getLogger(__name__)
+
+REQUEST_TIMEOUT = 10
+# The GreenWorks cloud is only reachable over the internet; DNS hiccups and
+# short connection failures happen. Retry briefly instead of failing a poll.
+RETRY_ATTEMPTS = 3
+
+
+class GreenWorksApiError(Exception):
+    """Base class for errors raised by the GreenWorks API client."""
+
+
+class GreenWorksConnectionError(GreenWorksApiError):
+    """The GreenWorks cloud could not be reached (DNS/network failure)."""
+
+
+class UnauthorizedException(GreenWorksApiError):
+    """The GreenWorks account credentials were rejected."""
+
+
+def _root_cause(err: BaseException) -> BaseException:
+    """Return the innermost exception of a chained exception."""
+    seen: set[int] = set()
+    while err.__cause__ is not None and id(err.__cause__) not in seen:
+        seen.add(id(err))
+        err = err.__cause__
+    return err
+
+
+def _describe_request_error(err: requests.exceptions.RequestException) -> str:
+    """Return a short, single-line description of a failed request.
+
+    requests/urllib3 exception messages repeat the full URL and traceback-like
+    details for every layer of the chain. That produced huge log entries in
+    Home Assistant, so only report the root cause here.
+    """
+    root = _root_cause(err)
+    if isinstance(root, socket.gaierror):
+        return f"DNS lookup failed ({root})"
+    if isinstance(root, OSError):
+        return f"{type(root).__name__}: {root}"
+    return f"{type(err).__name__}: {root}"
+
+
+def _parse_mower_state(value) -> MowerState:
+    """Convert the raw API value into a MowerState, tolerating unknown values."""
+    try:
+        return MowerState(int(value))
+    except (TypeError, ValueError):
+        logger.debug("Unknown mower main state %r; reporting as DISCONNECTED", value)
+        return MowerState.DISCONNECTED
+
+
+def _parse_timestamp(value, timezone: ZoneInfo) -> datetime | None:
+    """Convert a unix timestamp from the API into a datetime, if present."""
+    if isinstance(value, (int, float)) and value > 0:
+        return datetime.fromtimestamp(value, tz=timezone)
+    return None
+
+
+def _parse_request_time(value, timezone: ZoneInfo) -> datetime | None:
+    """Convert an ISO timestamp from the API into a datetime, if present."""
+    if isinstance(value, str) and value:
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone)
+        except ValueError:
+            logger.debug("Could not parse request_time %r", value)
+    return None
 
 
 @dataclass
@@ -80,151 +152,153 @@ class GreenWorksAPI:
 
     def __init__(self, email: str, password: str, timezone: str):
         """Initialize the GreenWorks class with user credentials."""
+        self._email = email
         self.user_password = password
-        logger.info("Initializing GreenWorksAPI client")
+        logger.debug("Initializing GreenWorksAPI client")
+        self._session = requests.Session()
+        retry = Retry(
+            total=RETRY_ATTEMPTS,
+            connect=RETRY_ATTEMPTS,
+            read=2,
+            backoff_factor=0.5,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        self._session.mount("https://", adapter)
+        self._session.mount("http://", adapter)
         self._login_user(email, self.user_password)
         self._get_user_info()
         self.UserTimezone = ZoneInfo(timezone)
         logger.debug("Timezone set to %s", timezone)
 
     def _login_user(self, email: str, password: str):
+        logger.debug("Attempting login for %s", email)
+        url = f"{self.base_url}user_auth"
+        body = {
+            "corp_id": "100fa2b00b622800",
+            "email": email,
+            "password": password,
+        }
         try:
-            logger.info("Attempting login for %s", email)
-            # Send POST request to the API
-            url = f"{self.base_url}user_auth"
-            body = {
-                "corp_id": "100fa2b00b622800",
-                "email": email,
-                "password": password,
-            }
-            response = requests.post(url, json=body, timeout=10)
-            logger.info("Login response status=%s", response.status_code)
+            response = self._session.post(url, json=body, timeout=REQUEST_TIMEOUT)
+        except requests.exceptions.RequestException as err:
+            message = _describe_request_error(err)
+            logger.debug("Login request failed: %s", message)
+            raise GreenWorksConnectionError(f"Login request failed: {message}") from err
+
+        if response.status_code in (401, 403):
+            raise UnauthorizedException(
+                f"Login rejected by the GreenWorks API (HTTP {response.status_code})"
+            )
+
+        try:
             data = response.json()
+        except ValueError as err:
+            raise GreenWorksApiError("Login response was not valid JSON") from err
 
-            data["expire_in"] = time.time() + data["expire_in"] - 300  # Set expiration time for access token
+        if not data.get("access_token") or not data.get("user_id"):
+            raise UnauthorizedException(
+                "Login response is missing 'user_id' and/or 'access_token'"
+            )
 
-            # Eventuelt check for nødvendige felter
-            if "user_id" not in data or "access_token" not in data:
-                raise ValueError("Login-svar mangler nødvendige felter: 'user_id' og/eller 'access_token'")
+        # Set expiration time for access token (refresh 5 minutes early)
+        data["expire_in"] = time.time() + data.get("expire_in", 3500) - 300
 
-            logger.info("Login successful for user_id=%s", data.get("user_id"))
-            self.login_info = Login_object(**data)
-
-        except Exception as e:
-            logger.exception("Login failed: %s", e)
-            raise RuntimeError(f"Fejl ved login: {e}") from e
+        logger.debug("Login successful for user_id=%s", data.get("user_id"))
+        self.login_info = Login_object(**data)
 
     def _get_user_info(self):
+        response = self.__request(f"user/{self.login_info.user_id}")
         try:
-            response = self.__request(f"user/{self.login_info.user_id}")
-            try:
-                payload = response.json()
-            except ValueError:
-                payload = {}
+            payload = response.json()
+        except ValueError as err:
+            raise GreenWorksApiError("User info response was not valid JSON") from err
 
-            logger.info("Fetched user info for user_id=%s; keys=%s", self.login_info.user_id, list(payload.keys()))
-            data = payload
-
-            self.user_info = User_info_object(**data)
-
-        except Exception as e:
-            logger.exception("Failed fetching user info: %s", e)
-            raise RuntimeError(f"Fejl") from e
+        logger.debug(
+            "Fetched user info for user_id=%s; keys=%s",
+            self.login_info.user_id,
+            list(payload.keys()),
+        )
+        self.user_info = User_info_object(**payload)
 
     def _get_mower_operating_status(self, product_id: int, mower_id: int) -> Mower_operating_status:
-        try:
-            logger.info("Requesting mower operating status (product_id=%s, mower_id=%s)", product_id, mower_id)
-            endpoint = f"product/{product_id}/v_device/{mower_id}"
-            response = self.__request(endpoint, params={"datapoints": "32"})
-            response.raise_for_status()  # Stopper ved 4xx/5xx
+        logger.debug(
+            "Requesting mower operating status (product_id=%s, mower_id=%s)",
+            product_id,
+            mower_id,
+        )
+        endpoint = f"product/{product_id}/v_device/{mower_id}"
+        response = self.__request(endpoint, params={"datapoints": "32"})
 
+        # Feltet "32" er en streng med JSON-indhold
+        raw_32 = response.json().get("32", "{}")
+        data = json.loads(raw_32).get("request", {})
 
-            # Feltet "32" er en streng med JSON-indhold
-            raw_32 = response.json().get("32", "{}")
-            parsed_32 = json.loads(raw_32)
-            data = parsed_32.get("request", {})
-
-            status = Mower_operating_status(
-                battery_status=data.get("battery_status", -1),
-                mower_main_state=MowerState(data.get("mower_main_state", -1)),
-                next_start=datetime.fromtimestamp(data.get("next_start", ""), tz=self.UserTimezone),
-                request_time=datetime.fromisoformat(data.get("request_time", "").replace("Z", "+00:00")).astimezone(self.UserTimezone)
-            )
-            logger.info(
-                "Operating status (mower_id=%s): battery=%s state=%s next_start=%s",
-                mower_id,
-                status.battery_status,
-                getattr(status.mower_main_state, "name", status.mower_main_state),
-                status.next_start,
-            )
-            return status
-        except Exception as e:
-            logger.exception("Error getting mower operating status (product_id=%s, mower_id=%s): %s", product_id, mower_id, e)
-            raise RuntimeError(f"Fejl ved hentning af plæneklipperens driftsstatus: {e}") from e
+        status = Mower_operating_status(
+            battery_status=data.get("battery_status", -1),
+            mower_main_state=_parse_mower_state(data.get("mower_main_state")),
+            next_start=_parse_timestamp(data.get("next_start"), self.UserTimezone),
+            request_time=_parse_request_time(data.get("request_time"), self.UserTimezone),
+        )
+        logger.debug(
+            "Operating status (mower_id=%s): battery=%s state=%s next_start=%s",
+            mower_id,
+            status.battery_status,
+            getattr(status.mower_main_state, "name", status.mower_main_state),
+            status.next_start,
+        )
+        return status
 
     def _get_device_properties(self, product_id: int, device_id: int) -> Mower_properties:
         endpoint = f"product/{product_id}/device/{device_id}/property"
-
-        try:
-            logger.info("Requesting device properties (product_id=%s, device_id=%s)", product_id, device_id)
-            response = self.__request(endpoint)
-            response.raise_for_status()  
-            
-            data = response.json()
-            logger.debug("Device properties retrieved (device_id=%s); keys=%s", device_id, list(data.keys()))
-            return Mower_properties(**data) 
-
-        except requests.exceptions.RequestException as e:
-            logger.exception("API error when fetching device properties: %s", e)
-            raise RuntimeError(f"Fejl under API-kald til {self.base_url}{endpoint}: {e}") from e
+        logger.debug(
+            "Requesting device properties (product_id=%s, device_id=%s)",
+            product_id,
+            device_id,
+        )
+        response = self.__request(endpoint)
+        data = response.json()
+        logger.debug("Device properties retrieved (device_id=%s); keys=%s", device_id, list(data.keys()))
+        return Mower_properties(**data)
 
     def get_devices(self) -> list[Mower]:
-        Mowers: list[Mower] = []
-        try:
-            logger.info("Fetching devices for user_id=%s", self.login_info.user_id)
-            endpoint = f"user/{self.login_info.user_id}/subscribe/devices?version=0"
-            response = self.__request(endpoint)
-            response.raise_for_status()  # Stopper hvis status != 2xx
+        """Fetch all mowers for the logged in user.
 
-            data = response.json()
+        Raises a GreenWorksApiError subclass when the API cannot be reached or
+        returns unusable data. Callers are expected to handle that (the HA
+        coordinator turns it into an UpdateFailed) instead of silently getting
+        an empty list, which made the mower entities disappear.
+        """
+        logger.debug("Fetching devices for user_id=%s", self.login_info.user_id)
+        endpoint = f"user/{self.login_info.user_id}/subscribe/devices?version=0"
+        response = self.__request(endpoint)
+        data = response.json()
 
-            # Tjek at 'list' findes i JSON og er en liste
-            devices = data.get("list")
-            if not isinstance(devices, list):
-                raise ValueError("JSON-svar indeholder ikke en gyldig 'list' af enheder")
-            
-            # Returner en liste af Mower objekter
-            for device in devices:
-                mower_properties = self._get_device_properties(device.get("product_id"), device.get("id"))
-                if mower_properties is None:
-                    raise ValueError(f"Kunne ikke hente egenskaber for enhed med ID {device.get('id')}")
-                mower_operating_status = self._get_mower_operating_status(device.get("product_id"), device.get("id"))
-                if mower_operating_status is None:
-                    raise ValueError(f"Kunne ikke hente tilstand for enhed med ID {device.get('id')}")
-                # Opret Mower objekt med de hentede data
-                mower = Mower(
-                    id=device.get("id"),
-                    name=device.get("name"),
-                    sn=device.get("sn"),
-                    is_online=device.get("is_online"),
-                    properties=mower_properties,
-                    operating_status=mower_operating_status,
-                    product_id=device.get("product_id")
-                )
-                # Tilføj Mower objektet til listen
-                Mowers.append(mower)
-                logger.info(
-                    "Device loaded id=%s name=%s sn=%s online=%s",
-                    mower.id,
-                    mower.name,
-                    mower.sn,
-                    mower.is_online,
-                )
-            return Mowers  # Returner listen af Mower objekter
-        
-        except Exception as e:
-            logger.exception("Failed to fetch devices: %s", e)
-            return []
+        devices = data.get("list")
+        if not isinstance(devices, list):
+            raise GreenWorksApiError("Device list response did not contain a valid 'list'")
+
+        mowers: list[Mower] = []
+        for device in devices:
+            mower_properties = self._get_device_properties(device.get("product_id"), device.get("id"))
+            mower_operating_status = self._get_mower_operating_status(device.get("product_id"), device.get("id"))
+            mower = Mower(
+                id=device.get("id"),
+                name=device.get("name"),
+                sn=device.get("sn"),
+                is_online=device.get("is_online"),
+                properties=mower_properties,
+                operating_status=mower_operating_status,
+                product_id=device.get("product_id"),
+            )
+            mowers.append(mower)
+            logger.debug(
+                "Device loaded id=%s name=%s sn=%s online=%s",
+                mower.id,
+                mower.name,
+                mower.sn,
+                mower.is_online,
+            )
+        return mowers
 
     def pause_mower(self, mower_id: int, duration: int = 0):
         """
@@ -260,36 +334,72 @@ class GreenWorksAPI:
         pass
 
     # private method for requesting data from api
-    def __request(self, endpoint:str, params={}, body={}):
+    def __request(
+        self,
+        endpoint: str,
+        params: dict | None = None,
+        body: dict | None = None,
+        _retry_auth: bool = True,
+    ) -> requests.Response:
         if time.time() > self.login_info.expire_in:
             self.refresh_access_token()
+
+        url = f"{self.base_url}{endpoint}"
+        headers = {
+            "Content-Type": "application/json",
+            "Access-Token": self.login_info.access_token,
+        }
+        logger.debug("GET %s params=%s", url, params)
+
         try:
-            url = f"{self.base_url}{endpoint}"
-            header = {'Content-Type':'application/json', "Access-Token": self.login_info.access_token}
-            logger.debug("GET %s params=%s", url, params)
-            
-            logger.debug("GET %s body=%s headers=%s", url, body, header)
-            response = requests.get(url,json=body, headers=header,params=params,timeout=10)
-            logger.debug("Response status=%s for %s", response.status_code, url)
-            if response.status_code == 403 and response.json().get("error", {}).get("code") == 4031022:
-                logger.warning("Access token rejected (4031022). Re-logging and retrying request: %s", endpoint)
-                self._login_user(self.user_info.email, self.user_password)
-                response = self.__request(endpoint, params, body)
+            response = self._session.get(
+                url,
+                json=body or {},
+                headers=headers,
+                params=params or {},
+                timeout=REQUEST_TIMEOUT,
+            )
+        except requests.exceptions.RequestException as err:
+            # DNS hiccups / connection failures are expected for a cloud
+            # integration. Keep this quiet; the raised error is reported once
+            # by the caller (Home Assistant shows it as an UpdateFailed).
+            message = _describe_request_error(err)
+            logger.debug("GreenWorks API request failed endpoint=%s: %s", endpoint, message)
+            raise GreenWorksConnectionError(
+                f"GreenWorks API unreachable ({endpoint}): {message}"
+            ) from err
 
+        if _retry_auth and response.status_code == 403:
+            try:
+                error_code = response.json().get("error", {}).get("code")
+            except ValueError:
+                error_code = None
+            if error_code == 4031022:
+                logger.debug(
+                    "Access token rejected (4031022); re-logging in and retrying %s", endpoint
+                )
+                self._login_user(self._email, self.user_password)
+                return self.__request(endpoint, params, body, _retry_auth=False)
 
+        try:
             response.raise_for_status()  # Kaster exception på 4xx/5xx
-            return response
-    
-        except requests.exceptions.RequestException as e:
-            # More context for troubleshooting
-            resp = getattr(e, "response", None)
-            status = getattr(resp, "status_code", "n/a")
-            body_preview = (getattr(resp, "text", "") or "")[:500]
-            logger.exception("Request failed endpoint=%s status=%s body=%s error=%s", endpoint, status, body_preview, e)
-            raise RuntimeError(f"Fejl under API-kald til {self.base_url}{endpoint}: status={status} error={e}") from e
-        
+        except requests.exceptions.HTTPError as err:
+            status = response.status_code
+            body_preview = (response.text or "")[:200]
+            logger.warning(
+                "GreenWorks API returned HTTP %s for %s (body=%s)",
+                status,
+                endpoint,
+                body_preview,
+            )
+            raise GreenWorksApiError(
+                f"GreenWorks API returned HTTP {status} for {endpoint}"
+            ) from err
+
+        return response
+
     def refresh_access_token(self):
-        logger.info("Refreshing access token")
+        logger.debug("Refreshing access token")
         url = f"{self.base_url}user/token/refresh"
         body = {
             "refresh_token": self.login_info.refresh_token,
@@ -298,36 +408,28 @@ class GreenWorksAPI:
             "Access-Token": self.login_info.access_token
         }
         try:
-            logger.debug("POST %s body=%s headers=%s", url, body, headers)
-            response = requests.post(url, json=body, headers=headers, timeout=10)
-            logger.info("Token refresh response status=%s", response.status_code)
-            if response.status_code != 200:
-                logger.warning("Failed to refresh access token: status=%s body=%s", response.status_code, response.text)
-                self._login_user(self.user_info.email, self.user_password)  # Re-login if refresh fails
-                logger.info("Performed re-login after refresh failure")
-                return
+            response = self._session.post(url, json=body, headers=headers, timeout=REQUEST_TIMEOUT)
+        except requests.exceptions.RequestException as err:
+            message = _describe_request_error(err)
+            logger.debug("Token refresh request failed: %s", message)
+            raise GreenWorksConnectionError(f"Token refresh failed: {message}") from err
+
+        logger.debug("Token refresh response status=%s", response.status_code)
+        if response.status_code != 200:
+            # Re-login if refresh fails
+            logger.debug(
+                "Token refresh rejected (HTTP %s); falling back to a full login",
+                response.status_code,
+            )
+            self._login_user(self._email, self.user_password)
+            return
+
+        try:
             data = response.json()
-            self.login_info.access_token = data.get("access_token")
-            self.login_info.refresh_token = data.get("refresh_token")
-            self.login_info.expire_in = int(time.time() + 3500)
-            logger.info("Access token refreshed successfully")
+        except ValueError as err:
+            raise GreenWorksApiError("Token refresh response was not valid JSON") from err
 
-        except requests.exceptions.RequestException as e:
-            logger.exception("HTTP error during token refresh: %s", e)
-            raise RuntimeError(f"Fejl under API-kald til {url}: {e}") from e
-
-        except ValueError as e:
-            logger.exception("Invalid JSON during token refresh: %s", e)
-            raise RuntimeError(f"Ugyldigt JSON-svar fra {url}: {e}") from e
-
-        except TypeError as e:
-            logger.exception("Type error during token refresh: %s", e)
-            raise RuntimeError(f"Fejl ved oprettelse af mower_info_object: {e}") from e
-
-        except Exception as e:
-            logger.exception("Unexpected error during token refresh: %s", e)
-            raise RuntimeError(f"Uventet fejl under API-kald til {url}: {e}") from e
-
-        
-class UnauthorizedException(Exception):
-    pass
+        self.login_info.access_token = data.get("access_token")
+        self.login_info.refresh_token = data.get("refresh_token")
+        self.login_info.expire_in = int(time.time() + 3500)
+        logger.debug("Access token refreshed successfully")

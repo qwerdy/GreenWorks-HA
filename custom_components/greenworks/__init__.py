@@ -8,14 +8,17 @@ import contextlib
 
 from homeassistant import config_entries, core
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
-from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-from .greenworks_api.GreenWorksAPI import GreenWorksAPI, Mower, UnauthorizedException
+from .greenworks_api.GreenWorksAPI import (
+    GreenWorksAPI,
+    GreenWorksApiError,
+    Mower,
+    UnauthorizedException,
+)
 from .const import CONF_MOWER_NAME, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
-_LOGGER.warning("🚀 Greenworks integration is loading! (warning)")
-_LOGGER.debug("🐞 Debug logging is working in Greenworks.")
 
 PLATFORMS: Final = ["lawn_mower", "sensor", "binary_sensor"]
 
@@ -27,6 +30,9 @@ async def async_setup_entry(hass: core.HomeAssistant, entry: config_entries.Conf
         api = await hass.async_add_executor_job(GreenWorksAPI, entry.data[CONF_EMAIL], entry.data[CONF_PASSWORD], hass.config.time_zone)
     except UnauthorizedException as err:
         raise ConfigEntryAuthFailed(err) from err
+    except GreenWorksApiError as err:
+        # Network/DNS problems are temporary; let Home Assistant retry setup.
+        raise ConfigEntryNotReady(f"GreenWorks API unavailable: {err}") from err
 
     coordinator = GreenWorksDataCoordinator(hass, api, entry.data[CONF_MOWER_NAME])
     hass.data[DOMAIN]["coordinator" + entry.data[CONF_MOWER_NAME]] = coordinator
@@ -69,7 +75,6 @@ class GreenWorksDataCoordinator(DataUpdateCoordinator):
     async def _async_update_data(self):
         """Fetch data from API endpoint."""
         try:
-            _LOGGER.debug("Fetching data from GreenWorks API")
             # Capture stdout from the third-party library (which uses print) so it appears in HA logs
             def _call_with_captured_stdout():
                 buf = io.StringIO()
@@ -83,9 +88,11 @@ class GreenWorksDataCoordinator(DataUpdateCoordinator):
             self._mower = await self.hass.async_add_executor_job(_call_with_captured_stdout)
             _LOGGER.debug("Fetched %d mowers: %s", len(self._mower), [m.name for m in self._mower])
             return self._mower
-        except KeyError as ex:
-            _LOGGER.error("KeyError calling GreenWorks API: %s", ex)
-            raise UpdateFailed("Problems calling GreenWorks") from ex
-        except Exception as ex:
-            _LOGGER.error("Unexpected error calling GreenWorks API: %s", ex)
-            raise UpdateFailed("Problems calling GreenWorks") from ex
+        except GreenWorksApiError as ex:
+            # Expected for a cloud integration (DNS/network hiccups, API errors).
+            # Home Assistant reports the UpdateFailed message, so don't log it
+            # here as well; the previous code dumped several tracebacks per poll.
+            raise UpdateFailed(str(ex)) from ex
+        except Exception as ex:  # noqa: BLE001 - report unexpected problems once
+            _LOGGER.debug("Unexpected error calling GreenWorks API", exc_info=True)
+            raise UpdateFailed(f"Unexpected error calling GreenWorks API: {ex}") from ex

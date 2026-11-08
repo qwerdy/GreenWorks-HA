@@ -15,7 +15,9 @@
       }
     },
     "error": {
-      "auth_error": "Authorization failed, check email and password."
+      "auth_error": "Authorization failed, check email and password.",
+      "cannot_connect": "Could not reach the GreenWorks service. Check the logs and try again.",
+      "unknown_error": "Unexpected error while talking to the GreenWorks service."
     },
     "abort": {
       "reauth_successful": "New login info has been saved"
