@@ -189,6 +189,10 @@ class GreenWorksAPI:
             raise UnauthorizedException(
                 f"Login rejected by the GreenWorks API (HTTP {response.status_code})"
             )
+        if not response.ok:
+            raise GreenWorksApiError(
+                f"Login failed with HTTP {response.status_code}"
+            )
 
         try:
             data = response.json()

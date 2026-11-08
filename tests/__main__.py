@@ -6,7 +6,11 @@ from zoneinfo import ZoneInfo
 # Add custom_components/greenworks to path to import greenworks_api directly
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'custom_components', 'greenworks'))
 
-from greenworks_api.GreenWorksAPI import GreenWorksAPI
+from greenworks_api.GreenWorksAPI import (
+    GreenWorksAPI,
+    GreenWorksApiError,
+    UnauthorizedException,
+)
 from greenworks_api.Records import Login_object, User_info_object
 
 from unittest import mock
@@ -37,6 +41,26 @@ def test_get_devices_live():
         print(f"Device Battery Status: {device.operating_status.battery_status}")
         print(f"Device Main State: {device.operating_status.mower_main_state.name}")
         print(f"Next Start: {device.operating_status.next_start}")
+
+def test_login_server_error_is_not_authentication_error():
+    """Temporary server failures must not trigger Home Assistant reauthentication."""
+    with mock.patch('greenworks_api.GreenWorksAPI.requests.Session') as mock_session:
+        response = mock.Mock()
+        response.status_code = 500
+        response.ok = False
+        response.json.return_value = {
+            "error": {"message": "temporary upstream failure"},
+        }
+        mock_session.return_value.post.return_value = response
+
+        try:
+            GreenWorksAPI("tester@example.com", "password", "Europe/Copenhagen")
+        except GreenWorksApiError as err:
+            assert not isinstance(err, UnauthorizedException)
+            assert "HTTP 500" in str(err)
+        else:
+            raise AssertionError("Expected the login server error to be raised")
+
 
 def test_refresh_access_token_success():
     """Ensure refresh_access_token updates tokens on success and doesn't re-login."""
@@ -161,7 +185,8 @@ def test_refresh_access_token_refresh_fail_relogin_success():
         assert api.login_info.refresh_token == "relogin-refresh"
 
 if __name__ == "__main__":
-    # Always run the unit (mocked) test
+    # Always run the unit (mocked) tests
+    test_login_server_error_is_not_authentication_error()
     test_refresh_access_token_success()
     test_refresh_access_token_refresh_fail_relogin_success()
 
